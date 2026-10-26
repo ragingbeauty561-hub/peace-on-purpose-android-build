@@ -1,0 +1,209 @@
+name: Build Peace On Purpose Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 36 and Bubblewrap
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          npm install --global @bubblewrap/cli@1.25.0
+          bubblewrap updateConfig --jdkPath="$JAVA_HOME" --androidSdkPath="$ANDROID_SDK_ROOT"
+
+      - name: Generate protected upload key and TWA manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYSTORE_PASSWORD="$(openssl rand -hex 32)"
+          echo "::add-mask::$KEYSTORE_PASSWORD"
+          echo "BUBBLEWRAP_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "BUBBLEWRAP_KEY_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+
+          keytool -genkeypair \
+            -keystore android-upload-key.jks \
+            -storetype JKS \
+            -alias android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEYSTORE_PASSWORD" \
+            -dname "CN=Peace On Purpose, OU=Android, O=Chasity Nicole Saylor, L=Fort Wayne, ST=Indiana, C=US"
+
+          FINGERPRINT="$(keytool -list -v -keystore android-upload-key.jks -alias android -storepass "$KEYSTORE_PASSWORD" | sed -n 's/.*SHA256: //p' | head -1)"
+          test -n "$FINGERPRINT"
+          echo "UPLOAD_CERT_SHA256=$FINGERPRINT" >> "$GITHUB_ENV"
+
+          python3 - "$FINGERPRINT" &lt;&lt;'PY'
+          import json, sys
+          fp = sys.argv[1]
+          manifest = {
+            "packageId": "com.chasitynicolesaylor.peaceonpurpose",
+            "host": "planner.chasitynicolesaylor.com",
+            "name": "Peace, On Purpose",
+            "launcherName": "Peace On Purpose",
+            "display": "standalone",
+            "themeColor": "#11100f",
+            "themeColorDark": "#11100f",
+            "navigationColor": "#11100f",
+            "navigationColorDark": "#11100f",
+            "navigationDividerColor": "#11100f",
+            "navigationDividerColorDark": "#11100f",
+            "backgroundColor": "#11100f",
+            "enableNotifications": True,
+            "startUrl": "/",
+            "iconUrl": "https://planner.chasitynicolesaylor.com/elite-icon.svg",
+            "maskableIconUrl": "https://planner.chasitynicolesaylor.com/elite-icon.svg",
+            "splashScreenFadeOutDuration": 300,
+            "signingKey": {"path": "android-upload-key.jks", "alias": "android"},
+            "appVersionName": "1.0.0",
+            "appVersionCode": 1,
+            "shortcuts": [],
+            "generatorApp": "bubblewrap-cli",
+            "webManifestUrl": "https://planner.chasitynicolesaylor.com/manifest.webmanifest",
+            "fallbackType": "customtabs",
+            "features": {},
+            "alphaDependencies": {"enabled": False},
+            "enableSiteSettingsShortcut": True,
+            "isChromeOSOnly": False,
+            "isMetaQuest": False,
+            "minSdkVersion": 24,
+            "orientation": "default",
+            "fingerprints": [{"value": fp}],
+            "additionalTrustedOrigins": [],
+            "retainedBundles": [],
+            "protocolHandlers": [],
+            "fileHandlers": [],
+            "launchHandlerClientMode": "",
+            "appVersion": "1.0.0"
+          }
+          with open("twa-manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+          assetlinks = [{
+            "relation": ["delegate_permission/common.handle_all_urls"],
+            "target": {
+              "namespace": "android_app",
+              "package_name": "com.chasitynicolesaylor.peaceonpurpose",
+              "sha256_cert_fingerprints": [fp]
+            }
+          }]
+          with open("assetlinks-upload-key.json", "w", encoding="utf-8") as f:
+              json.dump(assetlinks, f, indent=2)
+          PY
+
+          printf '%s\n' "$KEYSTORE_PASSWORD" > KEYSTORE_PASSWORD.txt
+          printf 'Package: com.chasitynicolesaylor.peaceonpurpose\nUpload certificate SHA-256: %s\n' "$FINGERPRINT" > ANDROID_SIGNING_INFO.txt
+
+      - name: Generate Android TWA project
+        shell: bash
+        run: |
+          set -euo pipefail
+          bubblewrap update --skipVersionUpgrade --manifest ./twa-manifest.json
+
+      - name: Build signed APK and AAB
+        shell: bash
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: ${{ env.BUBBLEWRAP_KEYSTORE_PASSWORD }}
+          BUBBLEWRAP_KEY_PASSWORD: ${{ env.BUBBLEWRAP_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          bubblewrap build --skipPwaValidation --manifest ./twa-manifest.json --signingKeyPath ./android-upload-key.jks --signingKeyAlias android
+          ls -lah app-release-signed.apk app-release-bundle.aab
+
+      - name: Prepare public release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-public release-secure
+          cp app-release-bundle.aab release-public/Peace-On-Purpose-1.0.0.aab
+          cp app-release-signed.apk release-public/Peace-On-Purpose-1.0.0.apk
+          cp assetlinks-upload-key.json release-public/assetlinks-upload-key.json
+          cp ANDROID_SIGNING_INFO.txt release-public/ANDROID_SIGNING_INFO.txt
+          cp twa-manifest.json release-public/twa-manifest.json
+
+          cp android-upload-key.jks release-secure/android-upload-key.jks
+          cp KEYSTORE_PASSWORD.txt release-secure/KEYSTORE_PASSWORD.txt
+          cp ANDROID_SIGNING_INFO.txt release-secure/ANDROID_SIGNING_INFO.txt
+          tar -czf signing-material.tar.gz -C release-secure .
+
+          cat > recovery-public-cert.pem &lt;&lt;'CERT'
+          -----BEGIN CERTIFICATE-----
+          MIIEnzCCAwegAwIBAgIUM5+XgWD/A7W5YSzXKs5iHiEwCM0wDQYJKoZIhvcNAQEL
+          BQAwXzEwMC4GA1UEAwwnUGVhY2UgT24gUHVycG9zZSBBbmRyb2lkIEJ1aWxkIFJl
+          Y292ZXJ5MR4wHAYDVQQKDBVDaGFzaXR5IE5pY29sZSBTYXlsb3IxCzAJBgNVBAYT
+          AlVTMB4XDTI2MTAyNjIxMDYwOVoXDTM2MTAyMzIxMDYwOVowXzEwMC4GA1UEAwwn
+          UGVhY2UgT24gUHVycG9zZSBBbmRyb2lkIEJ1aWxkIFJlY292ZXJ5MR4wHAYDVQQK
+          DBVDaGFzaXR5IE5pY29sZSBTYXlsb3IxCzAJBgNVBAYTAlVTMIIBojANBgkqhkiG
+          9w0BAQEFAAOCAY8AMIIBigKCAYEA3VjxY0dc6WEEHR1ZZnFVzJ/u8y33LkfZu/F5
+          GjxNj/8mFK4fDe0VQh+Vt4mdwP00EqUYpHthLkbD2gKZL/DzoEQzRCrgocEvNQZS
+          Rm8X66jDXh7LWUTTP0Vo1eT7/39lVtYZPELGSDtQ3E54LyOemUFfTuq0IdeyP4M9
+          iNtC073EOWK1zvc5cDxfg0MRpM7UwkCbpvt1rpFyu7YxojGP/xp1JR8gWr8jjNB/
+          I3kZ4AYhJlnUsh6GYqE2SsZQDYHHFeIq4gb5/28xZU/PZQjRjsU1hJGBruzdEiP/
+          znn22JZhHWOJu7R/B5G+FoD7glGDolbg5WWdtNLoLsJBEbFrRpHN9GULTOneQ014
+          ZRA34tR3EfsvGzjxBjlVqtW5GoEkAdOwyiPzQxBCdjNzXvOjFPtydRdA5ZahR3/r
+          Y6cGy0oQH0FMHLiaSSgm8sDQQsU2Rj7ZOng5G8vCCJ7fB2vtN7pEWcda/jKuN6bM
+          zgfDtyg2huTjp9BUK6Z5g93o9IxLAgMBAAGjUzBRMB0GA1UdDgQWBBS/XApsHvMQ
+          VMkYGJ+/+NS+RKh10DAfBgNVHSMEGDAWgBS/XApsHvMQVMkYGJ+/+NS+RKh10DAP
+          BgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBgQCmFDNTpLD+Xf7M1ftH
+          apFddCvk6SBeIfXHKSEmC6GoG7hWvQKNa+9NUFFUzxSlUlKN71Y343t+pMwRR4Cf
+          vatJtRedKjtQJFkEFAe0KzWEv0Xl2HS6QLz9SEO6Y9zBKY/istBrkA221WxLd2dd
+          jMA6bnK2NK9O5cDD9719heRUdVEWuklrmY85PYfj7e3IfuKrerI4NRDMFaRzcl06
+          mpNWD6lUfvDhg8nQQb4ZKEKV1a33f+f+YY4SGFq9cIF4nMa6h4z5lFeGojeKcTRR
+          2zeWgsTgfr4brhmcrWpQpLOJR3bp3QLcq+8tWzTSd8YwHxdcGiMObHtZhkgDM+UH
+          PRF7ZgQQK0vOVPCGz0OKKZ1nIs2Mj7NgXMiYDdn0x6AKMvgK8Am5WYwxRlGjoueE
+          SVHXAG5TPkzLv1m4+TvHPkLFbXR6+uSRIOim15bvRWy7hXAQus0ftpGdZdcCAvkC
+          ycxg8CntyjRAhmm242Ezqwf4bUsQdJQqwoytqMoi+9J/ntU=
+          -----END CERTIFICATE-----
+          CERT
+          openssl cms -encrypt -binary -aes-256-cbc \
+            -in signing-material.tar.gz \
+            -out signing-material.encrypted.p7m \
+            -outform DER \
+            recovery-public-cert.pem
+          rm -rf release-secure signing-material.tar.gz KEYSTORE_PASSWORD.txt android-upload-key.jks
+
+      - name: Upload Play Store release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peace-On-Purpose-Android-1.0.0
+          path: release-public/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload encrypted signing backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peace-On-Purpose-Signing-Backup-ENCRYPTED
+          path: signing-material.encrypted.p7m
+          if-no-files-found: error
+          retention-days: 90
